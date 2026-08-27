@@ -204,9 +204,10 @@ async def list_events(
 
     Returns:
         List of events with details. Recurring events are expanded into one entry per
-        occurrence; each carries "recurrence" (the RRULE, if the event is a series) and
-        "recurrence_id" (the occurrence's own start, for expanded instances). Note that
-        every occurrence shares the series' "id"/"url".
+        occurrence, each carrying "recurrence_id" (the occurrence's own start). Expansion
+        strips the rule, so "recurrence" is only populated for non-recurring events; a
+        non-empty "recurrence_id" is what marks a row as one occurrence of a series.
+        Note that every occurrence shares the series' "id"/"url".
     """
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
@@ -253,8 +254,10 @@ async def list_events(
     # Search events in all relevant calendars
     for calendar in calendars_to_search:
         try:
-            # Fetch events using date_search
-            events = calendar.date_search(start=start, end=end, expand=True)
+            # search(), not date_search(): date_search hardcodes split_expanded=False,
+            # which returns every expanded occurrence inside a single object, so
+            # vobject_instance.vevent would only ever see the first one.
+            events = calendar.search(start=start, end=end, event=True, expand=True)
 
             for event in events:
                 try:
