@@ -2,6 +2,7 @@
 
 import caldav
 import smtplib
+from dateutil.rrule import rrulestr
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,38 @@ def _get_caldav_client(email: str, password: str) -> caldav.DAVClient:
         username=email,
         password=password
     )
+
+
+def _normalize_rrule(recurrence: str) -> str:
+    """
+    Validate and normalize an iCalendar recurrence rule.
+
+    Accepts a bare rule ("FREQ=WEEKLY;COUNT=3") or one with the property name
+    included ("RRULE:FREQ=WEEKLY;COUNT=3"), in any case.
+
+    Args:
+        recurrence: RRULE value to validate
+
+    Returns:
+        The rule without its "RRULE:" prefix, uppercased (RRULE has no free-text
+        values, so this is lossless).
+
+    Raises:
+        ValueError: If the rule is empty or not a parseable recurrence rule.
+    """
+    rule = recurrence.strip()
+    if rule.upper().startswith('RRULE:'):
+        rule = rule[len('RRULE:'):].strip()
+    rule = rule.upper()
+
+    # No dtstart on purpose: passing one makes dateutil reject a naive DTSTART
+    # combined with a UTC UNTIL, which is the most common form of both.
+    try:
+        rrulestr(rule)
+    except Exception as e:
+        raise ValueError(f"Invalid recurrence rule {recurrence!r}: {e}")
+
+    return rule
 
 
 def _send_calendar_invitation(
