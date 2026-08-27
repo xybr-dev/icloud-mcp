@@ -7,6 +7,7 @@ import os
 import re
 import smtplib
 import ssl
+from dateutil.rrule import rrulestr
 from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -40,6 +41,31 @@ async def _to_thread(fn, *args, **kwargs):
     single-threaded MCP event loop.
     """
     return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+
+def _normalize_rrule(recurrence: str) -> str:
+    """
+    Validate and normalize an iCalendar recurrence rule.
+
+    Accepts a bare rule ("FREQ=WEEKLY;COUNT=3") or one with the property name
+    included ("RRULE:FREQ=WEEKLY;COUNT=3"), in any case.
+
+    Raises:
+        ValueError: If the rule is empty or not a parseable recurrence rule.
+    """
+    rule = recurrence.strip()
+    if rule.upper().startswith('RRULE:'):
+        rule = rule[len('RRULE:'):].strip()
+    rule = rule.upper()
+
+    # No dtstart on purpose: passing one makes dateutil reject a naive DTSTART
+    # combined with a UTC UNTIL, which is the most common form of both.
+    try:
+        rrulestr(rule)
+    except Exception as e:
+        raise ValueError(f"Invalid recurrence rule {recurrence!r}: {e}")
+
+    return rule
 
 
 def _event_base_url(event_id: str) -> str:
