@@ -380,7 +380,11 @@ async def list_events(
         end_date: End date filter in ISO format (YYYY-MM-DD)
 
     Returns:
-        List of events with details
+        List of events with details. Recurring events are expanded into one entry per
+        occurrence, each carrying "recurrence_id" (the occurrence's own start). Expansion
+        strips the rule, so "recurrence" is only populated for non-recurring events; a
+        non-empty "recurrence_id" is what marks a row as one occurrence of a series.
+        Note that every occurrence shares the series' "id"/"url".
     """
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
@@ -473,6 +477,14 @@ async def list_events(
                         except Exception as _e:
                             pass
 
+                    recurrence_id_value = ""
+                    if hasattr(vevent, 'recurrence_id') and vevent.recurrence_id:
+                        try:
+                            rid = vevent.recurrence_id.value
+                            recurrence_id_value = rid.isoformat() if hasattr(rid, 'isoformat') else str(rid)
+                        except Exception as _e:
+                            pass
+
                     result.append({
                         "id": str(event.url),
                         "summary": str(vevent.summary.value) if hasattr(vevent, 'summary') and vevent.summary else "",
@@ -480,6 +492,10 @@ async def list_events(
                         "start": start_value,
                         "end": end_value,
                         "location": str(vevent.location.value) if hasattr(vevent, 'location') and vevent.location else "",
+                        # Read RRULE off the VEVENT, never the raw ical - VTIMEZONE blocks
+                        # carry their own RRULE lines and would give false positives.
+                        "recurrence": str(vevent.rrule.value) if hasattr(vevent, 'rrule') and vevent.rrule else "",
+                        "recurrence_id": recurrence_id_value,
                         "calendar": calendar.name or "Unknown",
                         "url": str(event.url)
                     })
