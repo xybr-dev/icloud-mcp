@@ -170,7 +170,10 @@ async def list_events(
         end_date: End date filter in ISO format (YYYY-MM-DD)
 
     Returns:
-        List of events with details
+        List of events with details. Recurring events are expanded into one entry per
+        occurrence; each carries "recurrence" (the RRULE, if the event is a series) and
+        "recurrence_id" (the occurrence's own start, for expanded instances). Note that
+        every occurrence shares the series' "id"/"url".
     """
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
@@ -222,12 +225,23 @@ async def list_events(
 
             for event in events:
                 try:
-                    event.load()  # Ensure event data is loaded
+                    # only_if_unloaded matters: expanded recurrence instances all carry the
+                    # master event's URL, so an unconditional load() would re-fetch the
+                    # master and collapse every instance back to the series start date.
+                    event.load(only_if_unloaded=True)
                     vevent = event.vobject_instance.vevent
 
                     # Parse start/end dates safely
                     start_value = None
                     end_value = None
+                    recurrence_id_value = ""
+
+                    if hasattr(vevent, 'recurrence_id') and vevent.recurrence_id:
+                        try:
+                            rid = vevent.recurrence_id.value
+                            recurrence_id_value = rid.isoformat() if hasattr(rid, 'isoformat') else str(rid)
+                        except Exception as _e:
+                            pass
 
                     if hasattr(vevent, 'dtstart') and vevent.dtstart:
                         try:
@@ -257,6 +271,10 @@ async def list_events(
                         "end": end_value,
                         "location": str(vevent.location.value) if hasattr(vevent, 'location') and vevent.location else "",
                         "calendar": calendar.name or "Unknown",
+                        # Read RRULE off the VEVENT, never the raw ical - VTIMEZONE blocks
+                        # carry their own RRULE lines and would give false positives.
+                        "recurrence": str(vevent.rrule.value) if hasattr(vevent, 'rrule') and vevent.rrule else "",
+                        "recurrence_id": recurrence_id_value,
                         "url": str(event.url)
                     })
                 except Exception as _e:
