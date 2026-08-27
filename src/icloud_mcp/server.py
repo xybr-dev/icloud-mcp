@@ -74,6 +74,7 @@ async def calendar_create_event(
     description: str = None,
     location: str = None,
     attendees: list[str] = None,
+    recurrence: str = None,
     calendar_id: str = None
 ) -> dict:
     """
@@ -86,10 +87,14 @@ async def calendar_create_event(
         description: Event description (optional)
         location: Event location (optional)
         attendees: List of attendee email addresses to invite (optional)
+        recurrence: iCalendar RRULE making this a recurring series (optional).
+            Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
+            "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
+            start/end describe the first occurrence.
         calendar_id: Target calendar URL/ID (optional)
     """
     try:
-        return await calendar.create_event(context, summary, start, end, description, location, attendees, calendar_id)
+        return await calendar.create_event(context, summary, start, end, description, location, attendees, recurrence, calendar_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
@@ -105,10 +110,13 @@ async def calendar_update_event(
     end: str = None,
     description: str = None,
     location: str = None,
-    attendees: list[str] = None
+    attendees: list[str] = None,
+    recurrence: str = None
 ) -> dict:
     """
     Update an existing calendar event.
+
+    For a recurring event this updates the whole series, not a single occurrence.
 
     Args:
         event_id: Event URL/ID
@@ -118,9 +126,13 @@ async def calendar_update_event(
         description: New description (optional)
         location: New location (optional)
         attendees: New list of attendee email addresses (optional, replaces existing)
+        recurrence: iCalendar RRULE making this a recurring series (optional).
+            Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
+            "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
+            Pass "" to drop recurrence; omit to leave any existing rule alone.
     """
     try:
-        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees)
+        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees, recurrence)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
@@ -131,6 +143,8 @@ async def calendar_update_event(
 async def calendar_delete_event(context: Context, event_id: str) -> dict:
     """
     Delete a calendar event.
+
+    For a recurring event this deletes the whole series, not a single occurrence.
 
     Args:
         event_id: Event URL/ID to delete

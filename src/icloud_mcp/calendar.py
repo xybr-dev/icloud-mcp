@@ -328,6 +328,7 @@ async def create_event(
     description: Optional[str] = None,
     location: Optional[str] = None,
     attendees: Optional[List[str]] = None,
+    recurrence: Optional[str] = None,
     calendar_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -340,12 +341,19 @@ async def create_event(
         description: Event description (optional)
         location: Event location (optional)
         attendees: List of attendee email addresses to invite (optional)
+        recurrence: iCalendar RRULE making this a recurring series, e.g.
+            "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12" (optional). The start/end
+            arguments describe the first occurrence.
         calendar_id: Target calendar URL/ID (optional, defaults to first non-reminder calendar)
 
     Returns:
         Created event details
     """
     email, password = require_auth(context)
+
+    # Validate before touching the network, so a bad rule cannot half-create an event
+    rrule = _normalize_rrule(recurrence) if recurrence else None
+
     client = _get_caldav_client(email, password)
     principal = client.principal()
 
@@ -398,6 +406,9 @@ SEQUENCE:0
     if location:
         loc_escaped = location.replace('\\', '\\\\').replace(',', '\\,').replace(';', '\\;')
         ical_data += f"LOCATION:{loc_escaped}\n"
+    if rrule:
+        # Not escaped: RRULE's semicolons and commas are structural, not literal text
+        ical_data += f"RRULE:{rrule}\n"
 
     # Add attendees (meeting invitations)
     if attendees:
@@ -443,6 +454,7 @@ SEQUENCE:0
         "description": description or "",
         "location": location or "",
         "attendees": attendees or [],
+        "recurrence": rrule or "",
         "calendar": calendar.name,
         "url": str(event.url)
     }
@@ -456,10 +468,15 @@ async def update_event(
     end: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[List[str]] = None
+    attendees: Optional[List[str]] = None,
+    recurrence: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Update an existing calendar event.
+
+    For a recurring event this updates the WHOLE SERIES: expanded occurrences all
+    share the series' URL, so there is no way to address a single occurrence here.
+    Editing one occurrence only (RECURRENCE-ID / EXDATE) is not supported yet.
 
     Args:
         event_id: Event URL/ID
@@ -469,11 +486,17 @@ async def update_event(
         description: New description (optional)
         location: New location (optional)
         attendees: New list of attendee email addresses (optional, replaces existing)
+        recurrence: New iCalendar RRULE, e.g. "FREQ=WEEKLY;COUNT=12" (optional).
+            Pass "" to drop recurrence and leave a single event. Omit to leave any
+            existing rule untouched.
 
     Returns:
         Updated event details
     """
     email, password = require_auth(context)
+
+    # Validate before touching the network
+    rrule = _normalize_rrule(recurrence) if recurrence else None
 
     # Create a client with the correct base URL for this specific event
     # This prevents URL joining errors when event is on a different server (e.g., p72-caldav.icloud.com)
@@ -507,6 +530,15 @@ async def update_event(
             vevent.location.value = location
         else:
             vevent.add('location').value = location
+    if recurrence is not None:
+        if rrule:
+            if hasattr(vevent, 'rrule'):
+                vevent.rrule.value = rrule
+            else:
+                vevent.add('rrule').value = rrule
+        elif hasattr(vevent, 'rrule'):
+            # Empty string means "make this a single event"
+            vevent.remove(vevent.rrule)
 
     # Update attendees
     if attendees is not None:
@@ -574,6 +606,7 @@ async def update_event(
         "description": str(vevent.description.value) if hasattr(vevent, 'description') else "",
         "location": str(vevent.location.value) if hasattr(vevent, 'location') else "",
         "attendees": attendee_list,
+        "recurrence": str(vevent.rrule.value) if hasattr(vevent, 'rrule') else "",
         "url": str(event.url)
     }
 
@@ -581,6 +614,10 @@ async def update_event(
 async def delete_event(context: Context, event_id: str) -> Dict[str, str]:
     """
     Delete a calendar event.
+
+    For a recurring event this deletes the WHOLE SERIES: expanded occurrences all
+    share the series' URL, so there is no way to address a single occurrence here.
+    Deleting one occurrence only (EXDATE) is not supported yet.
 
     Args:
         event_id: Event URL/ID to delete
