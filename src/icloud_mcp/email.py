@@ -10,10 +10,9 @@ import sys
 import os
 import functools
 import anyio
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from email.message import EmailMessage
 from email.header import decode_header
-from email.utils import getaddresses
+from email.utils import getaddresses, formatdate
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastmcp import Context
@@ -681,46 +680,60 @@ async def search_messages(
         except Exception as _e:
             pass
 
-async def send_message(
-    context: Context,
+def _build_message(
+    username: str,
     to: str,
     subject: str,
-    body: str,
+    *,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
     cc: Optional[str] = None,
-    bcc: Optional[str] = None,
-    html: bool = False
-) -> Dict[str, str]:
+    bcc: Optional[str] = None
+) -> EmailMessage:
+    """Build the outgoing message. At least one of text/html is required.
+
+    EmailMessage rather than MIMEMultipart: set_content + add_alternative emit
+    a real multipart/alternative with the plain part first, and a single part
+    when only one body is given. The old hand-rolled version declared
+    'alternative' for HTML-only mail and then attached no alternative at all.
     """
-    Send an email message via SMTP.
+    if not text and not html:
+        raise ValueError("Message requires a text or html body")
 
-    Args:
-        to: Recipient email address
-        subject: Email subject
-        body: Email body content
-        cc: CC recipients (optional, comma-separated)
-        bcc: BCC recipients (optional, comma-separated)
-        html: Whether body is HTML (default: False)
-
-    Returns:
-        Confirmation message
-    """
-    username, password = require_auth(context)
-
-    # Create message
-    msg = MIMEMultipart('alternative') if html else MIMEText(body)
-
+    msg = EmailMessage()
     msg['From'] = username
     msg['To'] = to
     msg['Subject'] = subject
-
     if cc:
         msg['Cc'] = cc
     if bcc:
         msg['Bcc'] = bcc
 
-    if html:
-        msg.attach(MIMEText(body, 'html'))
+    # RFC 5322 makes Date mandatory and it is the originator's to set. It used
+    # to be added only after the SMTP leg, so sent mail went out without one
+    # and appended copies sorted by whatever the server invented.
+    msg['Date'] = formatdate(localtime=True)
 
+    if text:
+        msg.set_content(text)
+        if html:
+            msg.add_alternative(html, subtype='html')
+    else:
+        msg.set_content(html, subtype='html')
+
+    return msg
+
+
+def _resolve_recipients(
+    to: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None
+) -> List[str]:
+    """Validate to/cc/bcc and return the bare addresses the envelope may use.
+
+    Shared by every outbound path so the allowlist cannot be sidestepped by one
+    of them (e.g. drafting to a blocked address, then pressing Send in the client).
+    """
     recipients = [to]
     if cc:
         recipients.extend([addr.strip() for addr in cc.split(',')])
@@ -752,6 +765,72 @@ async def send_message(
                 "Recipient(s) not in EMAIL_SEND_ALLOWLIST: " + ", ".join(disallowed)
             )
 
+    return addrs
+
+
+async def _append_to_folder(
+    client,
+    folder: str,
+    msg,
+    flags: List[str],
+    fallbacks: tuple = ()
+) -> str:
+    """APPEND msg to folder, trying fallback names in turn; return the one used.
+
+    Raises when every candidate fails so the caller decides whether that is
+    fatal: the Sent copy is best-effort, a saved draft is not.
+    """
+    # SMTP policy: IMAP APPEND requires CRLF line endings (RFC 3501);
+    # bare as_bytes() emits LF and some servers mangle the stored copy
+    msg_bytes = msg.as_bytes(policy=email.policy.SMTP)
+
+    last_error = None
+    for name in [folder, *(f for f in fallbacks if f != folder)]:
+        try:
+            await _run(client.append, name, msg_bytes, flags=flags)
+            return name
+        except Exception as e:
+            last_error = e
+    raise last_error
+
+
+async def send_message(
+    context: Context,
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    html: bool = False,
+    text: Optional[str] = None
+) -> Dict[str, str]:
+    """
+    Send an email message via SMTP.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject
+        body: Email body content
+        cc: CC recipients (optional, comma-separated)
+        bcc: BCC recipients (optional, comma-separated)
+        html: Whether body is HTML (default: False)
+        text: Plain-text alternative, only used when html=True
+
+    Returns:
+        Confirmation message
+    """
+    username, password = require_auth(context)
+
+    msg = _build_message(
+        username, to, subject,
+        text=text if html else body,
+        html=body if html else None,
+        cc=cc,
+        bcc=bcc
+    )
+
+    addrs = _resolve_recipients(to, cc, bcc)
+
     # Send via SMTP (off the event loop; connect+login+send are blocking)
     client = await _run(_get_smtp_client, username, password)
     try:
@@ -777,30 +856,9 @@ async def send_message(
     try:
         imap_client = await _run(_get_imap_client, username, password)
 
-        # Add Date header if not present
-        if 'Date' not in msg:
-            from email.utils import formatdate
-            msg['Date'] = formatdate(localtime=True)
-
-        # Append message to Sent folder
-        # SMTP policy: IMAP APPEND requires CRLF line endings (RFC 3501);
-        # bare as_bytes() emits LF and some servers mangle the stored copy
-        msg_bytes = msg.as_bytes(policy=email.policy.SMTP)
-
-        # Try to append to Sent folder
-        try:
-            await _run(imap_client.append, config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
-        except Exception as e:
-            # If Sent Messages folder doesn't exist, try common alternatives
-            for folder_name in ['Sent', 'Sent Items', config.SENT_FOLDER]:
-                try:
-                    await _run(imap_client.append, folder_name, msg_bytes, flags=['\\Seen'])
-                    break
-                except Exception:
-                    continue
-            else:
-                # Log error but don't fail the send operation
-                logger.error(f"Could not save to Sent folder: {e}")
+        await _append_to_folder(
+            imap_client, config.SENT_FOLDER, msg, ['\\Seen'], ('Sent', 'Sent Items')
+        )
 
     except Exception as e:
         # Log error but don't fail the send operation
@@ -813,6 +871,63 @@ async def send_message(
     return {
         "status": "success",
         "message": f"Email sent to {to}"
+    }
+
+
+async def save_draft(
+    context: Context,
+    to: str,
+    subject: str,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None
+) -> Dict[str, str]:
+    """
+    Save a message to the Drafts folder without sending it.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject
+        text: Plain-text body (at least one of text/html is required)
+        html: HTML body; sent alongside text as multipart/alternative
+        cc: CC recipients (optional, comma-separated)
+        bcc: BCC recipients (optional, comma-separated)
+
+    Returns:
+        Confirmation message
+    """
+    username, password = require_auth(context)
+
+    # Same recipient rules as an actual send. A draft that skipped the
+    # allowlist would be a one-step bypass: draft to a blocked address, then
+    # press Send in the mail client, where the MCP no longer has a say.
+    _resolve_recipients(to, cc, bcc)
+
+    msg = _build_message(
+        username, to, subject, text=text, html=html, cc=cc, bcc=bcc
+    )
+
+    client = await _run(_get_imap_client, username, password)
+    try:
+        # Both flags: Apple Mail's own drafts carry \Draft and \Seen, and
+        # \Draft alone leaves the draft showing as unread in the client.
+        folder = await _append_to_folder(
+            client,
+            config.DRAFTS_FOLDER,
+            msg,
+            ['\\Draft', '\\Seen'],
+            ('Drafts', 'INBOX.Drafts')
+        )
+    finally:
+        try:
+            _close_imap_client(client)
+        except Exception as _e:
+            pass
+
+    return {
+        "status": "success",
+        "message": f"Draft saved to {folder}"
     }
 
 

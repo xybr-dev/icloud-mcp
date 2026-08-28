@@ -4,12 +4,14 @@ offload refactor's finally block referencing an unbound `client`).
 """
 
 import asyncio
+import email as email_stdlib
 
 import pytest
 
 from icloud_mcp import email as email_mod
 from icloud_mcp.email import (
     _decode_mime_header,
+    save_draft,
     list_folders,
     list_messages,
     get_message,
@@ -64,14 +66,23 @@ class FakeSMTP:
         pass
 
 
-class FakeSentIMAP:
-    """IMAP stand-in for the send path's Sent-folder append."""
+class FakeAppendIMAP:
+    """IMAP stand-in for any path that APPENDs (Sent copy, saved draft)."""
 
     def __init__(self):
-        self.appended = []
+        self.appended = []  # (folder, msg_bytes, flags)
 
     def append(self, folder, msg_bytes, flags=None):
-        self.appended.append(folder)
+        self.appended.append((folder, msg_bytes, flags))
+
+    @property
+    def last(self):
+        return self.appended[-1]
+
+    def parsed(self):
+        return email_stdlib.message_from_bytes(
+            self.last[1], policy=email_stdlib.policy.default
+        )
 
 
 # --- test 3: limit handling ----------------------------------------------
@@ -169,10 +180,87 @@ def test_send_refuses_recipient_outside_allowlist(monkeypatch, patch_auth):
 def test_send_allows_recipient_inside_allowlist(monkeypatch, patch_auth):
     monkeypatch.setattr(config, "EMAIL_SEND_ALLOWLIST", ["allowed@example.com"])
     smtp = FakeSMTP()
-    sent_imap = FakeSentIMAP()
+    sent_imap = FakeAppendIMAP()
     monkeypatch.setattr(email_mod, "_get_smtp_client", lambda u, p: smtp)
     monkeypatch.setattr(email_mod, "_get_imap_client", lambda u, p: sent_imap)
 
     result = run(send_message(None, to="allowed@example.com", subject="s", body="b"))
     assert result["status"] == "success"
     assert smtp.sent  # SMTP was actually invoked for an allowed recipient
+
+
+# --- test 8: save_draft -----------------------------------------------------
+
+def _no_connect(u, p):
+    raise AssertionError("no server may be contacted on this path")
+
+
+def test_save_draft_appends_to_drafts_with_draft_and_seen_flags(monkeypatch, patch_auth):
+    imap = FakeAppendIMAP()
+    monkeypatch.setattr(email_mod, "_get_imap_client", lambda u, p: imap)
+    # A draft must never open an SMTP connection.
+    monkeypatch.setattr(email_mod, "_get_smtp_client", _no_connect)
+
+    result = run(save_draft(None, to="you@example.com", subject="s", text="b"))
+
+    assert result["status"] == "success"
+    folder, _msg_bytes, flags = imap.last
+    assert folder == config.DRAFTS_FOLDER
+    assert set(flags) == {"\\Draft", "\\Seen"}
+
+
+def test_save_draft_sets_a_date_header(monkeypatch, patch_auth):
+    """mail-mcp's drafts come back with date: "" and sort unpredictably."""
+    imap = FakeAppendIMAP()
+    monkeypatch.setattr(email_mod, "_get_imap_client", lambda u, p: imap)
+
+    run(save_draft(None, to="you@example.com", subject="s", text="b"))
+
+    assert imap.parsed()["Date"]
+
+
+def test_save_draft_enforces_allowlist(monkeypatch, patch_auth):
+    monkeypatch.setattr(config, "EMAIL_SEND_ALLOWLIST", ["allowed@example.com"])
+    monkeypatch.setattr(email_mod, "_get_imap_client", _no_connect)
+    monkeypatch.setattr(email_mod, "_get_smtp_client", _no_connect)
+
+    with pytest.raises(ValueError):
+        run(save_draft(None, to="outsider@evil.com", subject="s", text="b"))
+
+
+def test_save_draft_requires_a_body(monkeypatch, patch_auth):
+    monkeypatch.setattr(email_mod, "_get_imap_client", _no_connect)
+
+    with pytest.raises(ValueError):
+        run(save_draft(None, to="you@example.com", subject="s"))
+
+
+# --- test 9: multipart/alternative shape ------------------------------------
+
+def test_text_and_html_produce_alternative_plain_first(monkeypatch, patch_auth):
+    imap = FakeAppendIMAP()
+    monkeypatch.setattr(email_mod, "_get_imap_client", lambda u, p: imap)
+
+    run(save_draft(
+        None, to="you@example.com", subject="s", text="plain", html="<p>rich</p>"
+    ))
+
+    msg = imap.parsed()
+    assert msg.get_content_type() == "multipart/alternative"
+    assert [p.get_content_type() for p in msg.iter_parts()] == [
+        "text/plain", "text/html"
+    ]
+
+
+def test_html_only_send_is_not_a_bogus_alternative(monkeypatch, patch_auth):
+    """Regression: send_message declared 'alternative' then attached only HTML."""
+    smtp = FakeSMTP()
+    imap = FakeAppendIMAP()
+    monkeypatch.setattr(email_mod, "_get_smtp_client", lambda u, p: smtp)
+    monkeypatch.setattr(email_mod, "_get_imap_client", lambda u, p: imap)
+
+    run(send_message(
+        None, to="you@example.com", subject="s", body="<p>rich</p>", html=True
+    ))
+
+    assert imap.parsed().get_content_type() == "text/html"
