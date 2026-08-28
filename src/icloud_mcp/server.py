@@ -102,7 +102,8 @@ async def calendar_create_event(
     location: str | None = None,
     attendees: list[str] | None = None,
     recurrence: str | None = None,
-    calendar_id: str | None = None
+    calendar_id: str | None = None,
+    reminders: list[int] | None = None
 ) -> dict:
     """
     Create a new calendar event.
@@ -118,9 +119,13 @@ async def calendar_create_event(
             Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
             "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
         calendar_id: Target calendar URL/ID (optional)
+        reminders: Alert offsets in minutes before the event, e.g. [60] for 1 hour
+            before, [60, 10] for two alerts. A negative value is an offset AFTER the
+            start, which is how an all-day event gets a time-of-day alert
+            ([-540] = 9:00 AM).
     """
     try:
-        return await calendar.create_event(context, summary, start, end, description, location, attendees, recurrence, calendar_id)
+        return await calendar.create_event(context, summary, start, end, description, location, attendees, recurrence, calendar_id, reminders)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except ValueError as e:
@@ -141,7 +146,8 @@ async def calendar_update_event(
     description: str | None = None,
     location: str | None = None,
     attendees: list[str] | None = None,
-    recurrence: str | None = None
+    recurrence: str | None = None,
+    reminders: list[int] | None = None
 ) -> dict:
     """
     Update an existing calendar event.
@@ -160,9 +166,14 @@ async def calendar_update_event(
             Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
             "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
             Pass "" to drop recurrence; omit to leave any existing rule alone.
+        reminders: Alert offsets in minutes before the event, e.g. [60] for 1 hour
+            before, [60, 10] for two alerts. A negative value is an offset AFTER the
+            start, which is how an all-day event gets a time-of-day alert
+            ([-540] = 9:00 AM).
+            Replaces existing alerts; pass [] to remove them all, omit to leave alone.
     """
     try:
-        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees, recurrence)
+        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees, recurrence, reminders)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except ValueError as e:
