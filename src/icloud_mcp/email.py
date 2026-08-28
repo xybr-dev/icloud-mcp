@@ -874,6 +874,63 @@ async def send_message(
     }
 
 
+async def save_draft(
+    context: Context,
+    to: str,
+    subject: str,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None
+) -> Dict[str, str]:
+    """
+    Save a message to the Drafts folder without sending it.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject
+        text: Plain-text body (at least one of text/html is required)
+        html: HTML body; sent alongside text as multipart/alternative
+        cc: CC recipients (optional, comma-separated)
+        bcc: BCC recipients (optional, comma-separated)
+
+    Returns:
+        Confirmation message
+    """
+    username, password = require_auth(context)
+
+    # Same recipient rules as an actual send. A draft that skipped the
+    # allowlist would be a one-step bypass: draft to a blocked address, then
+    # press Send in the mail client, where the MCP no longer has a say.
+    _resolve_recipients(to, cc, bcc)
+
+    msg = _build_message(
+        username, to, subject, text=text, html=html, cc=cc, bcc=bcc
+    )
+
+    client = await _run(_get_imap_client, username, password)
+    try:
+        # Both flags: Apple Mail's own drafts carry \Draft and \Seen, and
+        # \Draft alone leaves the draft showing as unread in the client.
+        folder = await _append_to_folder(
+            client,
+            config.DRAFTS_FOLDER,
+            msg,
+            ['\\Draft', '\\Seen'],
+            ('Drafts', 'INBOX.Drafts')
+        )
+    finally:
+        try:
+            _close_imap_client(client)
+        except Exception as _e:
+            pass
+
+    return {
+        "status": "success",
+        "message": f"Draft saved to {folder}"
+    }
+
+
 async def move_message(
     context: Context,
     message_id: str,

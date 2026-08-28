@@ -489,6 +489,38 @@ async def email_send(
         return {"error": "Internal error", "status": 500}
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
+async def email_save_draft(
+    context: Context,
+    to: str,
+    subject: str,
+    text: str | None = None,
+    html: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None
+) -> dict:
+    """
+    Save an email to the Drafts folder without sending it.
+
+    Args:
+        to: Recipient email address
+        subject: Email subject
+        text: Plain-text body (at least one of text/html is required)
+        html: HTML body; combined with text it is sent as multipart/alternative
+        cc: CC recipients (optional, comma-separated)
+        bcc: BCC recipients (optional, comma-separated)
+    """
+    try:
+        return await email_module.save_draft(context, to, subject, text, html, cc, bcc)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except ValueError as e:
+        return {"error": str(e), "status": 400}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def email_move(
     context: Context,

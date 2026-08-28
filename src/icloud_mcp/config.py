@@ -26,6 +26,7 @@ class Config:
 
     # Email folders
     SENT_FOLDER: str = os.getenv("SENT_FOLDER", "Sent Messages")
+    DRAFTS_FOLDER: str = os.getenv("DRAFTS_FOLDER", "Drafts")
 
     # Network timeout (seconds) for outbound IMAP/SMTP/CalDAV/CardDAV/HTTP calls
     HTTP_TIMEOUT: int = int(os.getenv("HTTP_TIMEOUT", "30"))

@@ -35,6 +35,7 @@ MCP (Model Context Protocol) server for iCloud integration, providing tools for 
 - `email_get_messages` - Get multiple messages at once (bulk fetch)
 - `email_search` - Search messages by text
 - `email_send` - Send email via SMTP
+- `email_save_draft` - Save an email to Drafts without sending
 - `email_move` - Move message to folder
 - `email_delete` - Delete or trash message
 - `email_mark_read` - Mark message as read
@@ -108,6 +109,10 @@ MCP_AUTH_TOKEN=
 HOST=127.0.0.1
 HTTP_TIMEOUT=30
 EMAIL_SEND_ALLOWLIST=
+
+# Email folders
+SENT_FOLDER=Sent Messages
+DRAFTS_FOLDER=Drafts
 ```
 
 | Variable | Description |
@@ -115,7 +120,9 @@ EMAIL_SEND_ALLOWLIST=
 | `MCP_AUTH_TOKEN` | Bearer token required on the HTTP transport. Unset by default, which leaves the HTTP transport unauthenticated. |
 | `HOST` | Bind address for the HTTP transport. Defaults to `127.0.0.1` (local only). |
 | `HTTP_TIMEOUT` | Timeout in seconds for outbound IMAP/SMTP/CalDAV/CardDAV calls. Defaults to `30`. |
-| `EMAIL_SEND_ALLOWLIST` | Comma-separated recipient addresses `email_send` is permitted to use. Empty (default) allows any recipient. |
+| `EMAIL_SEND_ALLOWLIST` | Comma-separated recipient addresses `email_send` and `email_save_draft` are permitted to use. Empty (default) allows any recipient. Drafts are checked too, since a draft to a blocked address only needs a click in the mail client to become a send. |
+| `SENT_FOLDER` | IMAP folder for the copy of a sent message. Defaults to `Sent Messages`; `Sent` and `Sent Items` are tried as fallbacks. |
+| `DRAFTS_FOLDER` | IMAP folder `email_save_draft` writes to. Defaults to `Drafts`. |
 
 ### Authentication
 
