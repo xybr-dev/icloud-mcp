@@ -68,6 +68,50 @@ def _normalize_rrule(recurrence: str) -> str:
     return rule
 
 
+def _normalize_reminders(reminders: List[int]) -> List[int]:
+    """Alarm offsets in minutes before the event start (negative = after).
+
+    Coercing to int is the trust boundary: these values are interpolated
+    straight into a VALARM TRIGGER line.
+
+    Raises:
+        ValueError: If an offset is not an integer number of minutes.
+    """
+    minutes = []
+    for m in reminders:
+        try:
+            minutes.append(int(m))
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid reminder offset {m!r}: expected minutes as an integer")
+    return minutes
+
+
+def _alarm_blocks(minutes: List[int]) -> str:
+    """VALARM blocks for minutes-before-start offsets (negative = after start)."""
+    blocks = ""
+    for m in minutes:
+        # RELATED=START is the RFC 5545 default, written explicitly because that
+        # is the exact form verified against iCloud in PR #16.
+        trigger = f"-PT{m}M" if m >= 0 else f"PT{-m}M"
+        blocks += (
+            "BEGIN:VALARM\nACTION:DISPLAY\nDESCRIPTION:Reminder\n"
+            f"TRIGGER;RELATED=START:{trigger}\nEND:VALARM\n"
+        )
+    return blocks
+
+
+def _event_reminders(vevent) -> List[int]:
+    """Minutes-before-start offsets of a stored event's alarms.
+
+    Absolute (DATE-TIME) triggers carry no minutes-before value and are skipped.
+    """
+    return [
+        round(-a.trigger.value.total_seconds() / 60)
+        for a in getattr(vevent, "valarm_list", [])
+        if isinstance(getattr(getattr(a, "trigger", None), "value", None), timedelta)
+    ]
+
+
 def _event_base_url(event_id: str) -> str:
     """Base URL for a per-event DAVClient, built from host (and port) only.
 
@@ -496,6 +540,7 @@ async def list_events(
                         # carry their own RRULE lines and would give false positives.
                         "recurrence": str(vevent.rrule.value) if hasattr(vevent, 'rrule') and vevent.rrule else "",
                         "recurrence_id": recurrence_id_value,
+                        "reminders": _event_reminders(vevent),
                         "calendar": calendar.name or "Unknown",
                         "url": str(event.url)
                     })
@@ -521,7 +566,8 @@ async def create_event(
     location: Optional[str] = None,
     attendees: Optional[List[str]] = None,
     recurrence: Optional[str] = None,
-    calendar_id: Optional[str] = None
+    calendar_id: Optional[str] = None,
+    reminders: Optional[List[int]] = None
 ) -> Dict[str, Any]:
     """
     Create a new calendar event.
@@ -536,12 +582,16 @@ async def create_event(
         recurrence: iCalendar RRULE making this a recurring series, e.g.
             "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12" (optional)
         calendar_id: Target calendar URL/ID (optional, defaults to first non-reminder calendar)
+        reminders: Alert offsets in minutes before the start, e.g. [60, 10] (optional).
+            A negative value is an offset AFTER the start, which is how an all-day
+            event gets a time-of-day alert ([-540] = 9:00 AM).
 
     Returns:
         Created event details
     """
-    # Validate before touching the network, so a bad rule cannot half-create an event
+    # Validate before touching the network, so bad input cannot half-create an event
     rrule = _normalize_rrule(recurrence) if recurrence else None
+    alarm_minutes = _normalize_reminders(reminders) if reminders else []
 
     email, password = require_auth(context)
     client = _get_caldav_client(email, password)
@@ -619,6 +669,9 @@ SEQUENCE:0
         # Not escaped: RRULE's semicolons and commas are structural, not literal text
         ical_data += f"RRULE:{rrule}\n"
 
+    # VALARM is a sub-component: it must sit after the VEVENT's own properties
+    ical_data += _alarm_blocks(alarm_minutes)
+
     # Add attendees (meeting invitations)
     if attendees:
         attendees = [_validate_attendee_email(a) for a in attendees]
@@ -665,6 +718,7 @@ SEQUENCE:0
         "location": location or "",
         "attendees": attendees or [],
         "recurrence": rrule or "",
+        "reminders": alarm_minutes,
         "calendar": calendar.name,
         "url": str(event.url)
     }
@@ -679,7 +733,8 @@ async def update_event(
     description: Optional[str] = None,
     location: Optional[str] = None,
     attendees: Optional[List[str]] = None,
-    recurrence: Optional[str] = None
+    recurrence: Optional[str] = None,
+    reminders: Optional[List[int]] = None
 ) -> Dict[str, Any]:
     """
     Update an existing calendar event.
@@ -697,12 +752,16 @@ async def update_event(
         attendees: New list of attendee email addresses (optional, replaces existing)
         recurrence: New iCalendar RRULE (optional). Pass "" to drop recurrence and make
             this a single event; omit to leave any existing rule alone.
+        reminders: New alert offsets in minutes before the start, e.g. [60, 10] (optional,
+            replaces existing alerts). A negative value is an offset AFTER the start.
+            Pass [] to remove all alerts; omit to leave existing ones alone.
 
     Returns:
         Updated event details
     """
-    # Validate before touching the network, so a bad rule cannot partially apply
+    # Validate before touching the network, so bad input cannot partially apply
     rrule = _normalize_rrule(recurrence) if recurrence else None
+    alarm_minutes = _normalize_reminders(reminders) if reminders is not None else None
 
     email, password = require_auth(context)
 
@@ -786,6 +845,18 @@ async def update_event(
             # Empty string means "make this a single event"
             vevent.remove(vevent.rrule)
 
+    # Alarms are replaced wholesale, like attendees below: [] clears them
+    if alarm_minutes is not None:
+        for stored in list(getattr(vevent, 'valarm_list', [])):
+            vevent.remove(stored)
+        for m in alarm_minutes:
+            alarm = vevent.add('valarm')
+            alarm.add('action').value = 'DISPLAY'
+            alarm.add('description').value = 'Reminder'
+            trigger = alarm.add('trigger')
+            trigger.value = timedelta(minutes=-m)
+            trigger.params['RELATED'] = ['START']
+
     # Update attendees
     if attendees is not None:
         attendees = [_validate_attendee_email(a) for a in attendees]
@@ -864,6 +935,7 @@ async def update_event(
         "location": str(vevent.location.value) if hasattr(vevent, 'location') else "",
         "attendees": attendee_list,
         "recurrence": str(vevent.rrule.value) if hasattr(vevent, 'rrule') else "",
+        "reminders": _event_reminders(vevent),
         "url": str(event.url)
     }
 
