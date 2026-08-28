@@ -463,7 +463,8 @@ async def email_send(
     body: str,
     cc: str | None = None,
     bcc: str | None = None,
-    html: bool = False
+    html: bool = False,
+    text: str | None = None
 ) -> dict:
     """
     Send an email message via SMTP.
@@ -475,11 +476,14 @@ async def email_send(
         cc: CC recipients (optional, comma-separated)
         bcc: BCC recipients (optional, comma-separated)
         html: Whether body is HTML (default: False)
+        text: Plain-text alternative for an HTML body (optional, only used when html=True)
     """
     try:
-        return await email_module.send_message(context, to, subject, body, cc, bcc, html)
+        return await email_module.send_message(context, to, subject, body, cc, bcc, html, text)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
+    except ValueError as e:
+        return {"error": str(e), "status": 400}
     except Exception:
         logger.exception("Tool execution failed")
         return {"error": "Internal error", "status": 500}

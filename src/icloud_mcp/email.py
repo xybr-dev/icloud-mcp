@@ -10,8 +10,7 @@ import sys
 import os
 import functools
 import anyio
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from email.message import EmailMessage
 from email.header import decode_header
 from email.utils import getaddresses, formatdate
 from typing import List, Dict, Any, Optional
@@ -681,6 +680,50 @@ async def search_messages(
         except Exception as _e:
             pass
 
+def _build_message(
+    username: str,
+    to: str,
+    subject: str,
+    *,
+    text: Optional[str] = None,
+    html: Optional[str] = None,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None
+) -> EmailMessage:
+    """Build the outgoing message. At least one of text/html is required.
+
+    EmailMessage rather than MIMEMultipart: set_content + add_alternative emit
+    a real multipart/alternative with the plain part first, and a single part
+    when only one body is given. The old hand-rolled version declared
+    'alternative' for HTML-only mail and then attached no alternative at all.
+    """
+    if not text and not html:
+        raise ValueError("Message requires a text or html body")
+
+    msg = EmailMessage()
+    msg['From'] = username
+    msg['To'] = to
+    msg['Subject'] = subject
+    if cc:
+        msg['Cc'] = cc
+    if bcc:
+        msg['Bcc'] = bcc
+
+    # RFC 5322 makes Date mandatory and it is the originator's to set. It used
+    # to be added only after the SMTP leg, so sent mail went out without one
+    # and appended copies sorted by whatever the server invented.
+    msg['Date'] = formatdate(localtime=True)
+
+    if text:
+        msg.set_content(text)
+        if html:
+            msg.add_alternative(html, subtype='html')
+    else:
+        msg.set_content(html, subtype='html')
+
+    return msg
+
+
 def _resolve_recipients(
     to: str,
     cc: Optional[str] = None,
@@ -758,7 +801,8 @@ async def send_message(
     body: str,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
-    html: bool = False
+    html: bool = False,
+    text: Optional[str] = None
 ) -> Dict[str, str]:
     """
     Send an email message via SMTP.
@@ -770,26 +814,20 @@ async def send_message(
         cc: CC recipients (optional, comma-separated)
         bcc: BCC recipients (optional, comma-separated)
         html: Whether body is HTML (default: False)
+        text: Plain-text alternative, only used when html=True
 
     Returns:
         Confirmation message
     """
     username, password = require_auth(context)
 
-    # Create message
-    msg = MIMEMultipart('alternative') if html else MIMEText(body)
-
-    msg['From'] = username
-    msg['To'] = to
-    msg['Subject'] = subject
-
-    if cc:
-        msg['Cc'] = cc
-    if bcc:
-        msg['Bcc'] = bcc
-
-    if html:
-        msg.attach(MIMEText(body, 'html'))
+    msg = _build_message(
+        username, to, subject,
+        text=text if html else body,
+        html=body if html else None,
+        cc=cc,
+        bcc=bcc
+    )
 
     addrs = _resolve_recipients(to, cc, bcc)
 
@@ -817,10 +855,6 @@ async def send_message(
     imap_client = None
     try:
         imap_client = await _run(_get_imap_client, username, password)
-
-        # Add Date header if not present
-        if 'Date' not in msg:
-            msg['Date'] = formatdate(localtime=True)
 
         await _append_to_folder(
             imap_client, config.SENT_FOLDER, msg, ['\\Seen'], ('Sent', 'Sent Items')
