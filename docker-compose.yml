@@ -5,7 +5,11 @@ services:
     build: .
     container_name: icloud-mcp-server
     ports:
-      - "${MCP_SERVER_PORT:-8000}:8000"
+      # Bound to loopback by default so the server is not reachable from other
+      # hosts on the network. To expose it beyond localhost (e.g. behind a
+      # reverse proxy), drop the "127.0.0.1:" prefix AND set MCP_AUTH_TOKEN
+      # below, plus put a reverse proxy in front for TLS/access control.
+      - "127.0.0.1:${MCP_SERVER_PORT:-8000}:8000"
     environment:
       # iCloud credentials (optional, can use headers instead)
       - ICLOUD_EMAIL=${ICLOUD_EMAIL:-}
@@ -17,5 +21,9 @@ services:
       - IMAP_SERVER=${IMAP_SERVER:-imap.mail.me.com}
       - SMTP_SERVER=${SMTP_SERVER:-smtp.mail.me.com}
       - PORT=8000
+
+      # Bearer token required by clients when set (Authorization: Bearer <token>).
+      # Required if the port publish above is ever exposed beyond 127.0.0.1.
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
 
     restart: unless-stopped

@@ -1,11 +1,36 @@
 """FastMCP server for iCloud integration."""
 
-from fastmcp import FastMCP
+import logging
+import sys
+
+from fastmcp import Context, FastMCP
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from mcp.types import ToolAnnotations
 from . import calendar, contacts, email as email_module
 from .auth import AuthenticationError
+from .config import config
 
-# Initialize FastMCP server
-mcp = FastMCP("iCloud MCP Server")
+# Log unexpected tool failures to stderr; never surface exception text to the
+# client (see the generic 500 branch in every tool below).
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.ERROR)
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.ERROR)
+_stderr_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(_stderr_handler)
+
+# Optional bearer-token gate for the HTTP transport. MCP_AUTH_TOKEN unset ->
+# auth=None -> gate disabled (back-compat with stdio and unauthenticated HTTP).
+_auth = (
+    StaticTokenVerifier(tokens={config.MCP_AUTH_TOKEN: {"client_id": "icloud-mcp", "scopes": []}})
+    if config.MCP_AUTH_TOKEN
+    else None
+)
+
+# mask_error_details keeps raw exception text (from explicitly-raised ToolError
+# aside) out of client responses; the tool bodies below also avoid returning
+# str(e) on the 500 path.
+mcp = FastMCP("iCloud MCP Server", auth=_auth, mask_error_details=True)
 
 
 # ============================================================================
@@ -19,7 +44,7 @@ async def health_check(request):
     return JSONResponse({
         "status": "healthy",
         "service": "icloud-mcp",
-        "transport": "sse"
+        "transport": "http"
     })
 
 
@@ -27,8 +52,8 @@ async def health_check(request):
 # Calendar Tools (CalDAV)
 # ============================================================================
 
-@mcp.tool()
-async def calendar_list_calendars(context) -> list | dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
+async def calendar_list_calendars(context: Context) -> list | dict:
     """
     List all available calendars.
 
@@ -38,16 +63,17 @@ async def calendar_list_calendars(context) -> list | dict:
         return await calendar.list_calendars(context)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def calendar_list_events(
-    context,
-    calendar_id: str = None,
-    start_date: str = None,
-    end_date: str = None
+    context: Context,
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None
 ) -> list | dict:
     """
     List calendar events with optional filtering.
@@ -61,20 +87,22 @@ async def calendar_list_events(
         return await calendar.list_events(context, calendar_id, start_date, end_date)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
 async def calendar_create_event(
-    context,
+    context: Context,
     summary: str,
     start: str,
     end: str,
-    description: str = None,
-    location: str = None,
-    attendees: list[str] = None,
-    calendar_id: str = None
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    recurrence: str | None = None,
+    calendar_id: str | None = None
 ) -> dict:
     """
     Create a new calendar event.
@@ -86,29 +114,39 @@ async def calendar_create_event(
         description: Event description (optional)
         location: Event location (optional)
         attendees: List of attendee email addresses to invite (optional)
+        recurrence: iCalendar RRULE making this a recurring series (optional).
+            Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
+            "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
         calendar_id: Target calendar URL/ID (optional)
     """
     try:
-        return await calendar.create_event(context, summary, start, end, description, location, attendees, calendar_id)
+        return await calendar.create_event(context, summary, start, end, description, location, attendees, recurrence, calendar_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except ValueError as e:
+        # Caller-fixable input (e.g. a malformed recurrence rule): surface the reason
+        return {"error": str(e), "status": 400}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def calendar_update_event(
-    context,
+    context: Context,
     event_id: str,
-    summary: str = None,
-    start: str = None,
-    end: str = None,
-    description: str = None,
-    location: str = None,
-    attendees: list[str] = None
+    summary: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    attendees: list[str] | None = None,
+    recurrence: str | None = None
 ) -> dict:
     """
     Update an existing calendar event.
+
+    Note: updating an event that has a recurrence rule affects the WHOLE SERIES.
 
     Args:
         event_id: Event URL/ID
@@ -118,19 +156,29 @@ async def calendar_update_event(
         description: New description (optional)
         location: New location (optional)
         attendees: New list of attendee email addresses (optional, replaces existing)
+        recurrence: iCalendar RRULE making this a recurring series (optional).
+            Examples: "FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=12",
+            "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=WEEKLY;UNTIL=20261231T000000Z".
+            Pass "" to drop recurrence; omit to leave any existing rule alone.
     """
     try:
-        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees)
+        return await calendar.update_event(context, event_id, summary, start, end, description, location, attendees, recurrence)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except ValueError as e:
+        # Caller-fixable input (e.g. a malformed recurrence rule): surface the reason
+        return {"error": str(e), "status": 400}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
-async def calendar_delete_event(context, event_id: str) -> dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+async def calendar_delete_event(context: Context, event_id: str) -> dict:
     """
     Delete a calendar event.
+
+    Note: deleting an event that has a recurrence rule deletes the WHOLE SERIES.
 
     Args:
         event_id: Event URL/ID to delete
@@ -139,17 +187,18 @@ async def calendar_delete_event(context, event_id: str) -> dict:
         return await calendar.delete_event(context, event_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def calendar_search_events(
-    context,
+    context: Context,
     query: str,
-    calendar_id: str = None,
-    start_date: str = None,
-    end_date: str = None
+    calendar_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None
 ) -> list | dict:
     """
     Search for events by text query.
@@ -164,16 +213,17 @@ async def calendar_search_events(
         return await calendar.search_events(context, query, calendar_id, start_date, end_date)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
 # ============================================================================
 # Contacts Tools (CardDAV)
 # ============================================================================
 
-@mcp.tool()
-async def contacts_list(context, limit: int = None) -> list | dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
+async def contacts_list(context: Context, limit: int | None = None) -> list | dict:
     """
     List all contacts.
 
@@ -184,12 +234,13 @@ async def contacts_list(context, limit: int = None) -> list | dict:
         return await contacts.list_contacts(context, limit)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
-async def contacts_get(context, contact_id: str) -> dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
+async def contacts_get(context: Context, contact_id: str) -> dict:
     """
     Get a specific contact by ID.
 
@@ -200,19 +251,20 @@ async def contacts_get(context, contact_id: str) -> dict:
         return await contacts.get_contact(context, contact_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
 async def contacts_create(
-    context,
+    context: Context,
     name: str,
-    phones: list[str] = None,
-    emails: list[str] = None,
-    addresses: list[str] = None,
-    organization: str = None,
-    title: str = None
+    phones: list[str] | None = None,
+    emails: list[str] | None = None,
+    addresses: list[str] | None = None,
+    organization: str | None = None,
+    title: str | None = None
 ) -> dict:
     """
     Create a new contact.
@@ -229,20 +281,21 @@ async def contacts_create(
         return await contacts.create_contact(context, name, phones, emails, addresses, organization, title)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def contacts_update(
-    context,
+    context: Context,
     contact_id: str,
-    name: str = None,
-    phones: list[str] = None,
-    emails: list[str] = None,
-    addresses: list[str] = None,
-    organization: str = None,
-    title: str = None
+    name: str | None = None,
+    phones: list[str] | None = None,
+    emails: list[str] | None = None,
+    addresses: list[str] | None = None,
+    organization: str | None = None,
+    title: str | None = None
 ) -> dict:
     """
     Update an existing contact.
@@ -260,12 +313,13 @@ async def contacts_update(
         return await contacts.update_contact(context, contact_id, name, phones, emails, addresses, organization, title)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
-async def contacts_delete(context, contact_id: str) -> dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+async def contacts_delete(context: Context, contact_id: str) -> dict:
     """
     Delete a contact.
 
@@ -276,12 +330,13 @@ async def contacts_delete(context, contact_id: str) -> dict:
         return await contacts.delete_contact(context, contact_id)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
-async def contacts_search(context, query: str) -> list | dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
+async def contacts_search(context: Context, query: str) -> list | dict:
     """
     Search for contacts by text query.
 
@@ -292,16 +347,17 @@ async def contacts_search(context, query: str) -> list | dict:
         return await contacts.search_contacts(context, query)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
 # ============================================================================
 # Email Tools (IMAP/SMTP)
 # ============================================================================
 
-@mcp.tool()
-async def email_list_folders(context) -> list | dict:
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
+async def email_list_folders(context: Context) -> list | dict:
     """
     List all email folders/mailboxes.
 
@@ -311,15 +367,16 @@ async def email_list_folders(context) -> list | dict:
         return await email_module.list_folders(context)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def email_list_messages(
-    context,
+    context: Context,
     folder: str = "INBOX",
-    limit: int = 50,
+    limit: int = 20,
     unread_only: bool = False
 ) -> list | dict:
     """
@@ -336,13 +393,14 @@ async def email_list_messages(
         return await email_module.list_messages(context, folder, limit, unread_only)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def email_get_message(
-    context,
+    context: Context,
     message_id: str,
     folder: str = "INBOX",
     include_body: bool = True,
@@ -361,13 +419,14 @@ async def email_get_message(
         return await email_module.get_message(context, message_id, folder, include_body, full_html)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def email_get_messages(
-    context,
+    context: Context,
     message_ids: list[str],
     folder: str = "INBOX",
     include_body: bool = True,
@@ -386,16 +445,17 @@ async def email_get_messages(
         return await email_module.get_messages(context, message_ids, folder, include_body, full_html)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 async def email_search(
-    context,
+    context: Context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 20
 ) -> list | dict:
     """
     Search for messages by text query.
@@ -409,18 +469,19 @@ async def email_search(
         return await email_module.search_messages(context, query, folder, limit)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
 async def email_send(
-    context,
+    context: Context,
     to: str,
     subject: str,
     body: str,
-    cc: str = None,
-    bcc: str = None,
+    cc: str | None = None,
+    bcc: str | None = None,
     html: bool = False
 ) -> dict:
     """
@@ -438,13 +499,14 @@ async def email_send(
         return await email_module.send_message(context, to, subject, body, cc, bcc, html)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def email_move(
-    context,
+    context: Context,
     message_id: str,
     from_folder: str,
     to_folder: str
@@ -461,13 +523,14 @@ async def email_move(
         return await email_module.move_message(context, message_id, from_folder, to_folder)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def email_delete(
-    context,
+    context: Context,
     message_id: str,
     folder: str = "INBOX",
     permanent: bool = False
@@ -484,13 +547,14 @@ async def email_delete(
         return await email_module.delete_message(context, message_id, folder, permanent)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def email_mark_read(
-    context,
+    context: Context,
     message_id: str,
     folder: str = "INBOX"
 ) -> dict:
@@ -505,13 +569,14 @@ async def email_mark_read(
         return await email_module.mark_as_read(context, message_id, folder)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
 async def email_mark_unread(
-    context,
+    context: Context,
     message_id: str,
     folder: str = "INBOX"
 ) -> dict:
@@ -526,8 +591,9 @@ async def email_mark_unread(
         return await email_module.mark_as_unread(context, message_id, folder)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
-    except Exception as e:
-        return {"error": str(e), "status": 500}
+    except Exception:
+        logger.exception("Tool execution failed")
+        return {"error": "Internal error", "status": 500}
 
 
 # ============================================================================
@@ -536,14 +602,7 @@ async def email_mark_unread(
 
 def run():
     """Run the MCP server."""
-    from .config import config as app_config
     mcp.run(transport="stdio")
-
-
-def run_http():
-    """Run the MCP server with HTTP transport."""
-    from .config import config as app_config
-    mcp.run(transport="sse", port=app_config.MCP_SERVER_PORT)
 
 
 if __name__ == "__main__":

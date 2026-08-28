@@ -102,11 +102,24 @@ SMTP_SERVER=smtp.mail.me.com
 MCP_SERVER_PORT=8000
 IMAP_PORT=993
 SMTP_PORT=587
+
+# HTTP transport access control (see Security Considerations)
+MCP_AUTH_TOKEN=
+HOST=127.0.0.1
+HTTP_TIMEOUT=30
+EMAIL_SEND_ALLOWLIST=
 ```
+
+| Variable | Description |
+|---|---|
+| `MCP_AUTH_TOKEN` | Bearer token required on the HTTP transport. Unset by default, which leaves the HTTP transport unauthenticated. |
+| `HOST` | Bind address for the HTTP transport. Defaults to `127.0.0.1` (local only). |
+| `HTTP_TIMEOUT` | Timeout in seconds for outbound IMAP/SMTP/CalDAV/CardDAV calls. Defaults to `30`. |
+| `EMAIL_SEND_ALLOWLIST` | Comma-separated recipient addresses `email_send` is permitted to use. Empty (default) allows any recipient. |
 
 ### Authentication
 
-The server supports two authentication methods (checked in order):
+**iCloud credentials** - the server supports two methods, checked in order:
 
 1. **Request Headers** (recommended for multi-user scenarios):
    - `X-Apple-Email`: iCloud email address
@@ -116,7 +129,9 @@ The server supports two authentication methods (checked in order):
    - `ICLOUD_EMAIL`
    - `ICLOUD_APP_SPECIFIC_PASSWORD`
 
-If credentials are not found in either location, the server returns a 401 error.
+If credentials are not found in either location, the server returns a 401 error. Credentials are held only for the duration of the request that uses them - they are not cached or persisted server-side.
+
+**MCP client access (HTTP transport)** - by default the HTTP transport accepts requests from anyone who can reach it, with no login of any kind. Set `MCP_AUTH_TOKEN` to require a `Bearer <token>` header on every request; without it, any client that can open a TCP connection to the server can call every tool, including `email_send`. See [Security Considerations](#security-considerations).
 
 ## Usage
 
@@ -141,6 +156,8 @@ docker-compose up
 ```
 
 The server will be available at `http://localhost:8000/mcp`.
+
+By default it binds to `127.0.0.1` and accepts unauthenticated requests. Read [Security Considerations](#security-considerations) before binding it to anything other than localhost.
 
 ## Integration with Claude Desktop
 
@@ -270,11 +287,13 @@ The server is fully stateless:
 
 ### Security Considerations
 
-- Always use HTTPS in production when using HTTP transport
-- Store App-Specific Passwords securely (use secret management tools)
-- Consider using header-based authentication for multi-user scenarios
-- Never commit `.env` file to version control
-- Network access is restricted to allowed iCloud domains only
+- **`network.allowedDomains` applies only to the stdio subprocess Claude Desktop launches**, and is enforced by Claude Desktop itself (see [Claude Desktop integration](#integration-with-claude-desktop)). The Streamable HTTP transport has no equivalent: a running HTTP server can reach any host the machine can reach.
+- **The HTTP transport is unauthenticated unless you set `MCP_AUTH_TOKEN`.** With it set, every request must carry a matching `Bearer <token>` header; without it, anyone who can reach the port can call every tool, including `email_send`.
+- By default the server binds to `127.0.0.1` only (set `HOST` to change this). `docker-compose.yml` publishes the port on `127.0.0.1` only, so the container is not reachable from other machines out of the box.
+- If you need to expose the server beyond localhost, you must set `MCP_AUTH_TOKEN`, and you should put it behind a reverse proxy with TLS - the server itself does not terminate TLS.
+- iCloud credentials (email and app-specific password) are held only for the duration of each request; they are not cached, logged, or persisted server-side.
+- Store App-Specific Passwords securely (use secret management tools) and never commit the `.env` file to version control.
+- Consider header-based iCloud credentials (`X-Apple-Email` / `X-Apple-App-Specific-Password`) for multi-user scenarios instead of a single shared `.env`.
 
 ## Development
 

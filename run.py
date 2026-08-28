@@ -40,8 +40,14 @@ def main():
 
     if args.http:
         port = args.port or int(os.environ.get("PORT", config.MCP_SERVER_PORT))
-        print(f"Starting iCloud MCP Server with Streamable HTTP on port {port}")
-        mcp.run(transport="http", host="0.0.0.0", port=port, path="/mcp")
+        print(f"Starting iCloud MCP Server with Streamable HTTP on {config.MCP_BIND_HOST}:{port}")
+        mcp.run(
+            transport="http",
+            host=config.MCP_BIND_HOST,
+            port=port,
+            path="/mcp",
+            host_origin_protection="auto",
+        )
     else:
         print("Starting iCloud MCP Server with stdio transport", file=sys.stderr)
         mcp.run(transport="stdio")
