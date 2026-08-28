@@ -13,7 +13,7 @@ import anyio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
-from email.utils import getaddresses
+from email.utils import getaddresses, formatdate
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastmcp import Context
@@ -681,6 +681,76 @@ async def search_messages(
         except Exception as _e:
             pass
 
+def _resolve_recipients(
+    to: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None
+) -> List[str]:
+    """Validate to/cc/bcc and return the bare addresses the envelope may use.
+
+    Shared by every outbound path so the allowlist cannot be sidestepped by one
+    of them (e.g. drafting to a blocked address, then pressing Send in the client).
+    """
+    recipients = [to]
+    if cc:
+        recipients.extend([addr.strip() for addr in cc.split(',')])
+    if bcc:
+        recipients.extend([addr.strip() for addr in bcc.split(',')])
+
+    # Reject any recipient that does not parse to exactly one address. A form
+    # like "attacker@evil.com," parses to zero addresses yet smtplib would
+    # still deliver it, sneaking past the allowlist; a multi-address string
+    # would split unpredictably. Fail loudly instead.
+    for r in recipients:
+        if len([a for _name, a in getaddresses([r]) if a]) != 1:
+            raise ValueError(f"Invalid recipient address: {r!r}")
+
+    # Normalize to bare addresses so the allowlist check and the SMTP envelope
+    # operate on the SAME set: raw recipient strings and getaddresses-parsed
+    # addresses diverge, so handing SMTP the raw strings would deliver to
+    # addresses the allowlist never approved.
+    addrs = [addr for _name, addr in getaddresses(recipients) if addr]
+
+    # Recipient allowlist: an empty list means allow all (back-compat). When
+    # set, every to/cc/bcc address must be present or the send is refused.
+    allowlist = config.EMAIL_SEND_ALLOWLIST
+    if allowlist:
+        allowed = {a.lower() for a in allowlist}
+        disallowed = [a for a in addrs if a.lower() not in allowed]
+        if disallowed:
+            raise ValueError(
+                "Recipient(s) not in EMAIL_SEND_ALLOWLIST: " + ", ".join(disallowed)
+            )
+
+    return addrs
+
+
+async def _append_to_folder(
+    client,
+    folder: str,
+    msg,
+    flags: List[str],
+    fallbacks: tuple = ()
+) -> str:
+    """APPEND msg to folder, trying fallback names in turn; return the one used.
+
+    Raises when every candidate fails so the caller decides whether that is
+    fatal: the Sent copy is best-effort, a saved draft is not.
+    """
+    # SMTP policy: IMAP APPEND requires CRLF line endings (RFC 3501);
+    # bare as_bytes() emits LF and some servers mangle the stored copy
+    msg_bytes = msg.as_bytes(policy=email.policy.SMTP)
+
+    last_error = None
+    for name in [folder, *(f for f in fallbacks if f != folder)]:
+        try:
+            await _run(client.append, name, msg_bytes, flags=flags)
+            return name
+        except Exception as e:
+            last_error = e
+    raise last_error
+
+
 async def send_message(
     context: Context,
     to: str,
@@ -721,36 +791,7 @@ async def send_message(
     if html:
         msg.attach(MIMEText(body, 'html'))
 
-    recipients = [to]
-    if cc:
-        recipients.extend([addr.strip() for addr in cc.split(',')])
-    if bcc:
-        recipients.extend([addr.strip() for addr in bcc.split(',')])
-
-    # Reject any recipient that does not parse to exactly one address. A form
-    # like "attacker@evil.com," parses to zero addresses yet smtplib would
-    # still deliver it, sneaking past the allowlist; a multi-address string
-    # would split unpredictably. Fail loudly instead.
-    for r in recipients:
-        if len([a for _name, a in getaddresses([r]) if a]) != 1:
-            raise ValueError(f"Invalid recipient address: {r!r}")
-
-    # Normalize to bare addresses so the allowlist check and the SMTP envelope
-    # operate on the SAME set: raw recipient strings and getaddresses-parsed
-    # addresses diverge, so handing SMTP the raw strings would deliver to
-    # addresses the allowlist never approved.
-    addrs = [addr for _name, addr in getaddresses(recipients) if addr]
-
-    # Recipient allowlist: an empty list means allow all (back-compat). When
-    # set, every to/cc/bcc address must be present or the send is refused.
-    allowlist = config.EMAIL_SEND_ALLOWLIST
-    if allowlist:
-        allowed = {a.lower() for a in allowlist}
-        disallowed = [a for a in addrs if a.lower() not in allowed]
-        if disallowed:
-            raise ValueError(
-                "Recipient(s) not in EMAIL_SEND_ALLOWLIST: " + ", ".join(disallowed)
-            )
+    addrs = _resolve_recipients(to, cc, bcc)
 
     # Send via SMTP (off the event loop; connect+login+send are blocking)
     client = await _run(_get_smtp_client, username, password)
@@ -779,28 +820,11 @@ async def send_message(
 
         # Add Date header if not present
         if 'Date' not in msg:
-            from email.utils import formatdate
             msg['Date'] = formatdate(localtime=True)
 
-        # Append message to Sent folder
-        # SMTP policy: IMAP APPEND requires CRLF line endings (RFC 3501);
-        # bare as_bytes() emits LF and some servers mangle the stored copy
-        msg_bytes = msg.as_bytes(policy=email.policy.SMTP)
-
-        # Try to append to Sent folder
-        try:
-            await _run(imap_client.append, config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
-        except Exception as e:
-            # If Sent Messages folder doesn't exist, try common alternatives
-            for folder_name in ['Sent', 'Sent Items', config.SENT_FOLDER]:
-                try:
-                    await _run(imap_client.append, folder_name, msg_bytes, flags=['\\Seen'])
-                    break
-                except Exception:
-                    continue
-            else:
-                # Log error but don't fail the send operation
-                logger.error(f"Could not save to Sent folder: {e}")
+        await _append_to_folder(
+            imap_client, config.SENT_FOLDER, msg, ['\\Seen'], ('Sent', 'Sent Items')
+        )
 
     except Exception as e:
         # Log error but don't fail the send operation
